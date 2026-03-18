@@ -39,6 +39,7 @@
 
 #include "../op/builtin.h"
 #include "arg_binder.h"
+#include "merge_if_stmt.h"
 #include "tir/transforms/ir_utils.h"
 
 namespace tvm {
@@ -297,6 +298,112 @@ PrimFunc MakePackedAPI(PrimFunc func) {
   std::vector<std::pair<PrimExpr, Var>> var_def;
   std::vector<std::pair<Var, Buffer>> buffer_def;
 
+  // First, collect a reverse map from Buffer->data var to parameter var so we
+  // can detect whether a buffer is actually used by the function body. In
+  // addition, collect variables that appear in the buffer's shape/stride so we
+  // can consider uses of those symbols as a use of the buffer itself.
+  std::unordered_map<const VarNode *, const VarNode *> data_var2param;
+  std::unordered_map<const VarNode *, std::vector<const VarNode *>>
+      shape_var2params;
+  for (const auto &kv : func_ptr->buffer_map) {
+    const Var &param = kv.first;
+    const Buffer &buf = kv.second;
+    data_var2param[buf->data.get()] = param.get();
+    auto record_shape_vars = [&](const PrimExpr &e) {
+      PostOrderVisit(e, [&](const ObjectRef &n) {
+        if (const auto *v = n.as<VarNode>()) {
+          shape_var2params[v].push_back(param.get());
+        }
+      });
+    };
+    for (const PrimExpr &e : buf->shape)
+      record_shape_vars(e);
+    for (const PrimExpr &e : buf->strides)
+      record_shape_vars(e);
+    if (buf->elem_offset.defined())
+      record_shape_vars(buf->elem_offset);
+  }
+
+  // A visitor that records
+  //  - which parameter buffers are used via their data var (load/store/direct),
+  //  - which shape/stride/offset symbols are referenced in the body.
+  // Shape symbols are not immediately attributed to all carrier buffers here;
+  // a minimal carrier set is selected after visiting.
+  struct UsedBufferDetector : public StmtExprVisitor {
+    UsedBufferDetector(
+        const std::unordered_map<const VarNode *, const VarNode *> &data2param,
+        const std::unordered_map<const VarNode *, std::vector<const VarNode *>>
+            &shape2params)
+        : data2param(data2param), shape2params(shape2params) {}
+    void VisitExpr_(const VarNode *op) override {
+      auto it = data2param.find(op);
+      if (it != data2param.end()) {
+        used_params_by_data.insert(it->second);
+      }
+      auto it2 = shape2params.find(op);
+      if (it2 != shape2params.end()) {
+        used_shape_vars.insert(op);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+    void VisitStmt_(const BufferStoreNode *op) override {
+      auto it = data2param.find(op->buffer->data.get());
+      if (it != data2param.end()) {
+        used_params_by_data.insert(it->second);
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+    void VisitExpr_(const BufferLoadNode *op) override {
+      auto it = data2param.find(op->buffer->data.get());
+      if (it != data2param.end()) {
+        used_params_by_data.insert(it->second);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    const std::unordered_map<const VarNode *, const VarNode *> &data2param;
+    const std::unordered_map<const VarNode *, std::vector<const VarNode *>>
+        &shape2params;
+    std::unordered_set<const VarNode *> used_params_by_data;
+    std::unordered_set<const VarNode *> used_shape_vars;
+  };
+
+  UsedBufferDetector detector(data_var2param, shape_var2params);
+  detector(func_ptr->body);
+
+  // Build the packed argument handling. While doing so, keep track of whether
+  // each parameter buffer is actually used. Unused input buffers can be
+  // nullable and do not require DLTensor field dereferences.
+  //
+  // Start from buffers used via data-var (definitely non-NULL), then for each
+  // referenced shape symbol pick a minimal "carrier" buffer that provides the
+  // symbol. Prefer carriers that are already used-by-data; otherwise pick one
+  // arbitrary carrier to ensure the symbol is bound.
+  std::unordered_set<const VarNode *> used_param_buffers =
+      detector.used_params_by_data;
+  for (const VarNode *sym : detector.used_shape_vars) {
+    auto it = shape_var2params.find(sym);
+    if (it == shape_var2params.end())
+      continue;
+    const auto &carriers = it->second;
+    bool has_used_carrier = false;
+    for (const VarNode *p : carriers) {
+      if (used_param_buffers.count(p)) {
+        has_used_carrier = true;
+        break;
+      }
+    }
+    // NOTE: With the new nullable shape binding logic in
+    // ArgBinder::BindDLTensors, we no longer need to force one carrier to be
+    // non-NULL. The binder will:
+    // 1. Assert that at least one carrier is non-NULL at runtime
+    // 2. Use cascaded if_then_else to read from the first non-NULL carrier
+    // So we can allow all carriers to be nullable.
+    // if (!has_used_carrier && !carriers.empty()) {
+    //   used_param_buffers.insert(carriers.front());
+    // }
+  }
+
   for (int i = 0; i < static_cast<int>(func_ptr->params.size()); ++i) {
     Var param = func_ptr->params[i];
     PrimExpr arg_value;
@@ -311,7 +418,23 @@ PrimFunc MakePackedAPI(PrimFunc func) {
     DataType dtype = param.dtype();
     if (dtype.is_handle()) {
       std::ostringstream msg;
-      msg << name_hint << ": Expect arg[" << i << "] to be pointer";
+      // Prefer the Buffer name if available; otherwise, fall back to param name
+      // (trim _handle).
+      std::string display_name;
+      auto it_buf = func_ptr->buffer_map.find(param);
+      if (it_buf != func_ptr->buffer_map.end()) {
+        const auto &kv = *it_buf;
+        display_name = kv.second->data->name_hint;
+      } else {
+        display_name = param->name_hint;
+        const char *suffix = "_handle";
+        if (display_name.size() >= 7 &&
+            display_name.compare(display_name.size() - 7, 7, suffix) == 0) {
+          display_name.erase(display_name.size() - 7);
+        }
+      }
+      msg << "kernel " << name_hint << " input " << display_name
+          << " expected pointer or tensor handle";
       seq_init.emplace_back(
           AssertStmt(type_index == ffi::TypeIndex::kTVMFFINone ||
                          type_index == ffi::TypeIndex::kTVMFFIOpaquePtr ||
@@ -331,7 +454,8 @@ PrimFunc MakePackedAPI(PrimFunc func) {
                          handle_from_tensor, arg_value);
     } else if (dtype.is_bool()) {
       std::ostringstream msg;
-      msg << name_hint << ": Expect arg[" << i << "] to be boolean";
+      msg << "kernel " << name_hint << " scalar " << param->name_hint
+          << " expected boolean";
       seq_init.emplace_back(
           AssertStmt(type_index == ffi::TypeIndex::kTVMFFIBool ||
                          type_index == ffi::TypeIndex::kTVMFFIInt,
@@ -341,7 +465,8 @@ PrimFunc MakePackedAPI(PrimFunc func) {
 
     } else if (dtype.is_int() || dtype.is_uint()) {
       std::ostringstream msg;
-      msg << name_hint << ": Expect arg[" << i << "] to be int";
+      msg << "kernel " << name_hint << " scalar " << param->name_hint
+          << " expected integer";
       seq_init.emplace_back(
           AssertStmt(type_index == ffi::TypeIndex::kTVMFFIInt ||
                          type_index == ffi::TypeIndex::kTVMFFIBool,
@@ -350,7 +475,8 @@ PrimFunc MakePackedAPI(PrimFunc func) {
     } else {
       ICHECK(dtype.is_float());
       std::ostringstream msg;
-      msg << name_hint << ": Expect arg[" << i << "] to be float";
+      msg << "kernel " << name_hint << " scalar " << param->name_hint
+          << " expected float";
       seq_init.emplace_back(
           AssertStmt(type_index == ffi::TypeIndex::kTVMFFIFloat ||
                          type_index == ffi::TypeIndex::kTVMFFIInt ||
@@ -387,11 +513,14 @@ PrimFunc MakePackedAPI(PrimFunc func) {
     binder.Bind(param, expr, name_hint + "." + param->name_hint, true);
   }
 
+  binder.BindDLTensors(buffer_def, device_type, device_id, name_hint,
+                       used_param_buffers, detector.used_shape_vars);
   for (const auto &[var, buffer] : buffer_def) {
-    binder.BindDLTensor(buffer, device_type, device_id, var,
-                        name_hint + "." + var->name_hint);
+    // Prefer buffer data var name in diagnostics to avoid exposing low-level
+    // handle vars
     arg_buffer_declarations.push_back(DeclBuffer(buffer, nop));
   }
+
   // reset global symbol to attach prefix
   func = WithAttrs(
       std::move(func),
@@ -436,7 +565,6 @@ PrimFunc MakePackedAPI(PrimFunc func) {
 
   func_ptr->buffer_map = ffi::Map<Var, Buffer>();
   func_ptr->ret_type = PrimType(DataType::Int(32));
-
   // return the function.
   return func;
 }
@@ -467,6 +595,7 @@ tvm::transform::Pass MakePackedAPI() {
           func.CopyOnWrite()->body = body.value();
         }
         func = MakePackedAPI(std::move(func));
+        func = MergeIfStmtSubstitute(func);
 
         if (!func.same_as(orig_func)) {
           updates->Add(gvar, func);

@@ -6,10 +6,7 @@ import tilelang.language.tir.op as _tir_op
 import functools
 
 
-def serial(start: PrimExpr,
-           stop: PrimExpr = None,
-           *,
-           annotations: dict[str, Any] = None) -> frame.ForFrame:
+def serial(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The serial For statement.
 
     Parameters
@@ -31,10 +28,7 @@ def serial(start: PrimExpr,
     return _ir.serial(start=start, stop=stop, annotations=annotations)
 
 
-def parallel(start: PrimExpr,
-             stop: PrimExpr = None,
-             *,
-             annotations: dict[str, Any] = None) -> frame.ForFrame:
+def parallel(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The parallel For statement.
 
     Parameters
@@ -56,10 +50,7 @@ def parallel(start: PrimExpr,
     return _ir.parallel(start=start, stop=stop, annotations=annotations)
 
 
-def vectorized(start: PrimExpr,
-               stop: PrimExpr = None,
-               *,
-               annotations: dict[str, Any] = None) -> frame.ForFrame:
+def vectorized(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The vectorized For statement.
 
     Parameters
@@ -81,10 +72,7 @@ def vectorized(start: PrimExpr,
     return _ir.vectorized(start=start, stop=stop, annotations=annotations)
 
 
-def unroll(start: PrimExpr,
-           stop: PrimExpr = None,
-           *,
-           annotations: dict[str, Any] = None) -> frame.ForFrame:
+def unroll(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The unrolled For statement.
 
     Parameters
@@ -161,7 +149,6 @@ def grid(*extents: PrimExpr) -> frame.ForFrame:
 
 
 def _dtype_forward(func):
-
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
         if "dtype" in kwargs:
@@ -172,7 +159,6 @@ def _dtype_forward(func):
 
 
 def _op_wrapper(func):
-
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
         if "dtype" in kwargs:
@@ -206,6 +192,7 @@ exp2 = _op_wrapper(_tir_op.exp2)
 exp10 = _op_wrapper(_tir_op.exp10)
 floor = _op_wrapper(_tir_op.floor)
 ceildiv = _op_wrapper(_tir_op.ceildiv)
+cdiv = ceildiv
 floordiv = _op_wrapper(_tir_op.floordiv)
 floormod = _op_wrapper(_tir_op.floormod)
 fmod = _op_wrapper(_tir_op.fmod)
@@ -274,6 +261,7 @@ ptx_wait_group = _op_wrapper(_tir_op.ptx_wait_group)
 ptx_commit_group = _op_wrapper(_tir_op.ptx_commit_group)
 ptx_cp_async_barrier = _op_wrapper(_tir_op.ptx_cp_async_barrier)
 ptx_init_barrier_thread_count = _op_wrapper(_tir_op.ptx_init_barrier_thread_count)
+ptx_fence_barrier_init = _op_wrapper(_tir_op.ptx_fence_barrier_init)
 ptx_arrive_barrier = _op_wrapper(_tir_op.ptx_arrive_barrier)
 ptx_arrive_barrier_expect_tx = _op_wrapper(_tir_op.ptx_arrive_barrier_expect_tx)
 ptx_wait_barrier = _op_wrapper(_tir_op.ptx_wait_barrier)
@@ -290,7 +278,9 @@ anylist_setitem_call_packed = _op_wrapper(_tir_op.anylist_setitem_call_packed)
 anylist_setitem_call_cpacked = _op_wrapper(_tir_op.anylist_setitem_call_cpacked)
 vscale = _op_wrapper(_tir_op.vscale)
 
-reinterpret = _dtype_forward(_tir_op.reinterpret)
+# reinterpret = _dtype_forward(_tir_op.reinterpret)
+reinterpret = _tir_op.reinterpret
+
 call_extern = _dtype_forward(_tir_op.call_extern)
 call_intrin = _dtype_forward(_tir_op.call_intrin)
 call_llvm_intrin = _dtype_forward(_tir_op.call_llvm_intrin)

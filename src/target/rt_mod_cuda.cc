@@ -1,5 +1,7 @@
+#include "../transform/common/attr.h"
 #include "codegen_cuda.h"
 #include "runtime/cuda/cuda_module.h"
+#include "runtime/meta_data.h"
 #include "runtime/pack_args.h"
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
@@ -31,10 +33,27 @@ ExtractFuncInfo(const IRModule &mod) {
         dtype = DataType::Int(32);
       info.arg_types.push_back(dtype);
     }
+    if (f->HasNonzeroAttr(tl::attr::kHasGridSync)) {
+      info.launch_param_tags.push_back(
+          runtime::launch_param::kUseProgramaticDependentLaunch);
+    }
+    if (f->HasNonzeroAttr("use_cooperative_groups")) {
+      info.launch_param_tags.push_back(
+          runtime::launch_param::kUseCooperativeLaunch);
+    }
+    if (f->GetAttr<ffi::Array<Integer>>("cluster_dims").defined()) {
+      info.launch_param_tags.push_back(runtime::launch_param::kClusterDimX);
+      info.launch_param_tags.push_back(runtime::launch_param::kClusterDimY);
+      info.launch_param_tags.push_back(runtime::launch_param::kClusterDimZ);
+    }
     if (auto opt = f->GetAttr<ffi::Array<ffi::String>>(
             tir::attr::kKernelLaunchParams)) {
       for (const auto &tag : opt.value()) {
-        info.launch_param_tags.push_back(tag);
+        if (tag != runtime::launch_param::kClusterDimX &&
+            tag != runtime::launch_param::kClusterDimY &&
+            tag != runtime::launch_param::kClusterDimZ) {
+          info.launch_param_tags.push_back(tag);
+        }
       }
     }
     auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);

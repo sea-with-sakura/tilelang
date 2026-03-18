@@ -2,7 +2,6 @@
  * \file eliminate_storage_sync_for_mbarrier.cc
  */
 #include "../op/builtin.h"
-#include "./storage_access.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
 #include <tvm/ffi/function.h>
@@ -55,6 +54,7 @@ public:
           return Stmt();
         }
       } else if (call->op.same_as(builtin::ptx_arrive_barrier()) ||
+                 call->op.same_as(tl::ptx_arrive_cluster_barrier()) ||
                  call->op.same_as(builtin::ptx_wait_barrier())) {
         in_mbarrier_region_ = true;
       }

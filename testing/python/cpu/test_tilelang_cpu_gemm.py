@@ -5,14 +5,14 @@ import tilelang.language as T
 import torch
 
 
-def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     num_stages = 0
 
     @T.prim_func
     def matmul(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_cpu=True) as (bx, by):
             A_local = T.alloc_local((block_M, block_K), dtype)
@@ -31,7 +31,6 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             # )
 
             for ko in T.Pipelined(K // block_K, num_stages=num_stages):
-
                 T.copy(A[by * block_M, ko * block_K], A_local)
 
                 # Or Copy with Parallel
@@ -62,14 +61,13 @@ def test_matmul_codegen():
 
 
 def test_matmul_compile():
-
-    def matmul_jit_test(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+    def matmul_jit_test(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
         # a simple kernel just for jit test
         @T.prim_func
         def matmul(
-                A: T.Tensor((M, K), dtype),
-                B: T.Tensor((K, N), dtype),
-                C: T.Tensor((M, N), dtype),
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
         ):
             with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_cpu=True) as (bx, by):
                 A_local = T.alloc_local((block_M, block_K), dtype)
@@ -103,9 +101,9 @@ def test_matmul_compile():
     block_M, block_N, block_K = M // 4, N // 4, K // 4
     cpu_func = matmul_jit_test(M, N, K, block_M, block_N, block_K)
     with tvm.target.Target("c"):
-        complied_fun = tilelang.compile(cpu_func, -1, execution_backend="ctypes")
+        complied_fun = tilelang.compile(cpu_func, -1, execution_backend="cython")
 
-    in_dtype = "float16"
+    in_dtype = T.float16
     A = torch.randn(M, K, dtype=torch.__getattribute__(in_dtype))
     B = torch.randn(K, N, dtype=torch.__getattribute__(in_dtype))
 
@@ -113,6 +111,44 @@ def test_matmul_compile():
     C_torch = torch.matmul(A, B)
 
     tilelang.testing.torch_assert_close(C, C_torch, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
+
+
+def test_matmul_with_copy_cython():
+    """CPU kernel using T.copy with cython backend.
+
+    Verifies that T.copy works end-to-end on CPU: the vectorized copy
+    uses vector types (e.g. float4) defined in common.h, and the
+    wrapper correctly skips redundant re-lowering.
+    """
+    M, N, K = 128, 128, 128
+    block_M, block_N, block_K = 32, 32, 32
+
+    @T.prim_func
+    def matmul(
+        A: T.Tensor((M, K), "float32"),
+        B: T.Tensor((K, N), "float32"),
+        C: T.Tensor((M, N), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), is_cpu=True) as (bx, by):
+            A_local = T.alloc_local((block_M, block_K), "float32")
+            B_local = T.alloc_local((block_K, block_N), "float32")
+            C_local = T.alloc_local((block_M, block_N), "float32")
+
+            T.clear(C_local)
+            for ko in T.serial(K // block_K):
+                T.copy(A[by * block_M, ko * block_K], A_local)
+                T.copy(B[ko * block_K, bx * block_N], B_local)
+                for i, j, k in T.grid(block_M, block_N, block_K):
+                    C_local[i, j] += A_local[i, k] * B_local[k, j]
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    compiled = tilelang.compile(matmul, target="c", out_idx=-1, execution_backend="cython")
+
+    a = torch.randn(M, K, dtype=torch.float32)
+    b = torch.randn(K, N, dtype=torch.float32)
+    c = compiled(a, b)
+    ref = a @ b
+    torch.testing.assert_close(c, ref, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

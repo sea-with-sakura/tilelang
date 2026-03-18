@@ -6,9 +6,11 @@
 #ifndef TVM_TL_LAYOUT_LAYOUT_H_
 #define TVM_TL_LAYOUT_LAYOUT_H_
 
+#include <exception>
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/ffi/object.h>
+#include <tvm/tir/buffer.h>
 #include <utility>
 
 #include "../support/ffi_aliases.h"
@@ -17,6 +19,25 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+// Common layout-related exceptions
+class LayoutConflictException : public std::exception {
+public:
+  const char *what() const noexcept override { return msg_.c_str(); }
+  explicit LayoutConflictException(const std::string &msg) : msg_(msg) {}
+
+private:
+  std::string msg_;
+};
+
+class LoopLayoutInjectiveException : public std::exception {
+public:
+  const char *what() const noexcept override { return msg_.c_str(); }
+  explicit LoopLayoutInjectiveException(const std::string &msg) : msg_(msg) {}
+
+private:
+  std::string msg_;
+};
 
 class Layout;
 class Fragment;
@@ -40,10 +61,38 @@ public:
 
   virtual Array<PrimExpr> Forward(const Array<PrimExpr> &vars) const;
 
+  // Repeat the layout along a single input dimension and prepend a new output
+  // dimension that indicates the repeat-group index.
+  //
+  // For a layout L with input shape S and forward index F, repeating along
+  // dimension `dim` with `factor` constructs a new layout L' where:
+  //   - New input shape: S'[dim] = S[dim] * factor
+  //   - New forward index: [i_dim // S[dim]] + F(..., i_dim % S[dim], ...)
+  virtual Layout Repeat(int dim, int factor) const;
+
+  // Expand (lift) this layout by prepending new leading input dimensions that
+  // are forwarded unchanged to the output.
+  //
+  // For example, given a 2D layout L: [J, K] -> F(J, K), calling
+  // Expand([I]) produces a 3D layout L': [I, J, K] -> [I] + F(J, K).
+  //
+  // `leading_shape` can contain multiple dimensions.
+  virtual Layout Expand(const Array<PrimExpr> &leading_shape) const;
+
   virtual Layout Inverse() const;
 
+  // Reshape the layout to a new logical shape. When aliasing buffers of
+  // different dtypes, the element count may change while the underlying
+  // byte-size stays equal. Use rescale_num/rescale_den to represent the
+  // ratio between the old element size and the new element size in bytes.
+  // Specifically, define factor = rescale_num / rescale_den where:
+  //   new_num_elems = old_num_elems * factor
+  // For example, f32->i8 (4B -> 1B) uses rescale_num=4, rescale_den=1.
+  // i8->f32 (1B -> 4B) uses rescale_num=1, rescale_den=4.
   virtual Layout Reshape(const Array<PrimExpr> &shape,
-                         arith::Analyzer *analyzer) const;
+                         arith::Analyzer *analyzer = nullptr,
+                         const PrimExpr rescale_num = Integer(1),
+                         const PrimExpr rescale_den = Integer(1)) const;
 
   virtual std::pair<Layout, arith::IterMapLevel> InverseWithLevel() const;
 
@@ -86,7 +135,10 @@ public:
 
   Layout Inverse() const final;
 
-  Layout Reshape(const Array<PrimExpr> &shape, arith::Analyzer *analyzer) const;
+  Layout Reshape(const Array<PrimExpr> &shape,
+                 arith::Analyzer *analyzer = nullptr,
+                 const PrimExpr rescale_num = Integer(1),
+                 const PrimExpr rescale_den = Integer(1)) const;
 
   std::pair<Layout, arith::IterMapLevel> InverseWithLevel() const final;
 
@@ -116,6 +168,8 @@ public:
 
   bool IsCompletedReplicated() const;
 
+  arith::IterMapResult DetectInjective() const;
+
   static void RegisterReflection();
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fragment", FragmentNode, LayoutNode);
@@ -140,6 +194,20 @@ public:
   TVM_DLL Fragment(Array<PrimExpr> input_size, Array<PrimExpr> forward_index,
                    PrimExpr forward_thread, PrimExpr replicate_size,
                    Optional<Var> replicate_var);
+
+  /*!
+   * \brief Create a fully replicated fragment layout.
+   *
+   * A fully replicated fragment means all threads hold identical copies of the
+   * entire buffer. This is useful for index buffers or masks that need to be
+   * accessed uniformly across all threads.
+   *
+   * \param shape The shape of the buffer.
+   * \param thread_extent The number of threads.
+   * \return A Fragment where each thread has a complete copy of all elements.
+   */
+  TVM_DLL static Fragment FullyReplicated(Array<PrimExpr> shape,
+                                          PrimExpr thread_extent);
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Fragment, Layout, FragmentNode);
 };
@@ -175,8 +243,8 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
                                const int warp_n, const int element_size,
                                const int k_pack, bool transposed = false);
 
-// Default Memory Layout
-Layout makeGemmLayoutLinear(int stride, int continuous);
+// Default Memory Layout (row-major linear layout for any dimension)
+Layout makeLinearLayout(Array<PrimExpr> shape);
 Layout makeGemmABLayoutPadded(int stride, int continuous, int element_size);
 Layout makeGemmABLayout(int mat_stride, int mat_continuous, int continuity,
                         int element_size, bool k_inner = true);
@@ -202,14 +270,37 @@ Layout makeTensorOpMultiplicand(int mat_stride, int mat_continuous,
 Layout makeGemmSparseAmpereABLayout(int mat_stride, int mat_continuous,
                                     int elementsize);
 
-Layout makeFullBankSwizzleLayout(int stride, int continuous, int element_size);
-Layout makeHalfBankSwizzleLayout(int stride, int continuous, int element_size);
-Layout makeQuarterBankSwizzleLayout(int stride, int continuous,
-                                    int element_size);
+Layout makeFullBankSwizzleLayout(const Buffer &buffer);
+Layout makeHalfBankSwizzleLayout(const Buffer &buffer);
+Layout makeQuarterBankSwizzleLayout(const Buffer &buffer);
+
+// Swizzle mode for shared memory layouts (nvidia only)
+// Smaller enum value = smaller swizzle granularity
+enum class SwizzleMode {
+  kNone = 0,    // Not a swizzle layout (linear or padded)
+  kQuarter = 1, // 32B swizzle (CU_TENSOR_MAP_SWIZZLE_32B)
+  kHalf = 2,    // 64B swizzle (CU_TENSOR_MAP_SWIZZLE_64B)
+  kFull = 3     // 128B swizzle (CU_TENSOR_MAP_SWIZZLE_128B)
+};
+
+// Detect which swizzle mode a layout uses
+SwizzleMode DetectSwizzleMode(const Layout &layout, const Buffer &buffer);
+
+// Merge two swizzle layouts by taking the smaller granularity
+// Returns NullOpt if either layout is not a swizzle layout
+Optional<Layout> MergeSwizzleLayouts(const Layout &layout1,
+                                     const Layout &layout2,
+                                     const Buffer &buffer);
 
 namespace attr {
 // BlockAttr, Containing the layout for all the buffers in the block
 constexpr const char *kLayoutMap = "layout_map";
+// ForAttr, Containing the parallel loop layout for a parallel for loop
+constexpr const char *kParallelLoopLayout = "parallel_loop_layout";
+// ForAttr, Containing the predicate for a parallel for loop
+constexpr const char *kParallelLoopPredicate = "parallel_loop_predicate";
+// ForAttr, Width (in elements) for coalesced memory access
+constexpr const char *kCoalescedWidth = "coalesced_width";
 } // namespace attr
 
 } // namespace tl

@@ -1,20 +1,21 @@
 from .gemm_base import GemmBase
+from .inst import GemmInst
 from tilelang.layout import make_swizzled_layout
 from tilelang.intrinsics.mfma_macro_generator import (
-    MatrixCoreIntrinEmitter,)
+    MatrixCoreIntrinEmitter,
+)
 from tilelang.utils.language import is_shared, is_fragment, is_full_region
 from tilelang import tvm as tvm
 from tvm.target import Target
+from tvm.ir import Range
 from tvm import tir
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
 
 
 class GemmMFMA(GemmBase):
-
     def infer_layout(self, target: Target, thread_nums: int):
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            False)
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MFMA)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         mfma_emitter = MatrixCoreIntrinEmitter(
@@ -28,6 +29,8 @@ class GemmMFMA(GemmBase):
             warp_row_tiles=warp_row_tiles,
             warp_col_tiles=warp_col_tiles,
             chunk=self.chunk,
+            k_pack=self.k_pack,
+            target=target,
         )
 
         if self.is_gemm_ss():
@@ -55,12 +58,11 @@ class GemmMFMA(GemmBase):
                 self.C: mfma_emitter.make_mfma_store_layout(self.C),
             }
         else:
-            raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
+            raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
 
-    def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            False)
+    def lower(self, layout_map: dict, target: Target, thread_bounds: Range, thread_var: tir.Var):
+        thread_nums = thread_bounds.extent
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MFMA)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         mfma_emitter = MatrixCoreIntrinEmitter(
@@ -75,8 +77,11 @@ class GemmMFMA(GemmBase):
             warp_col_tiles=warp_col_tiles,
             chunk=self.chunk,
             thread_var=thread_var,
+            k_pack=self.k_pack,
+            target=target,
         )
 
+        k_pack = mfma_emitter.k_pack
         in_dtype = self.in_dtype
         warp_rows = mfma_emitter.warp_rows
         warp_cols = mfma_emitter.warp_cols
@@ -97,7 +102,10 @@ class GemmMFMA(GemmBase):
 
         clear_accum = self.clear_accum
 
-        assert block_K >= micro_size_k, f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k})"
+        assert block_K >= micro_size_k * k_pack, f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
+        assert block_K % (micro_size_k * k_pack) == 0, (
+            f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
+        )
 
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
@@ -110,11 +118,11 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
-                B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // micro_size_k)):
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                     # Load A into fragment
                     mfma_emitter.ldmatrix_a(
                         A_local,
@@ -145,13 +153,12 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
 
                 if clear_accum:
                     T.clear(C_buf)
 
-                for ki in T.serial(0, (block_K // micro_size_k)):
-
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                     # Load A into fragment
                     mfma_emitter.ldmatrix_a(
                         A_local,
@@ -177,11 +184,10 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // micro_size_k)):
-
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                     # Load B into fragment
                     mfma_emitter.ldmatrix_b(
                         B_local,
@@ -207,7 +213,7 @@ class GemmMFMA(GemmBase):
                 accumulating into C_local.
                 """
 
-                for ki in T.serial(0, (block_K // micro_size_k)):
+                for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
                     # Perform Matrix Multiplication
                     mfma_emitter.mfma(A_buf, B_buf, C_buf, ki)
 
@@ -215,8 +221,7 @@ class GemmMFMA(GemmBase):
             # Must inline let statements to simplify the analysis
             return _Simplify(_gemm_rsr, inline_let=True)
         else:
-            raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
+            raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
 
     def is_gemm_ss(self) -> bool:
         return is_shared(self.A) and is_shared(self.B)

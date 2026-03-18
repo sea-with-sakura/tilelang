@@ -6,6 +6,8 @@
 
 #include "operator.h"
 
+#include "builtin.h"
+
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op_attr_types.h>
 
@@ -24,16 +26,14 @@ using namespace tir;
  *
  * @param call The TIR Call whose operator and arguments will be used to build
  * the TileOperator.
- * @param vmap Buffer mapping passed through to the builder to resolve buffer
- * references.
  * @return TileOperator The constructed TileOperator, or a default (empty)
  * TileOperator if no builder exists.
  */
-TileOperator ParseOperator(Call call, BufferMap vmap) {
+TileOperator ParseOperator(Call call) {
   auto op_map = Op::GetAttrMap<OpBuilderFunc>("TLOpBuilder");
   Op op = call->op.as<Op>().value();
   if (op_map.count(op)) {
-    auto tile_op = op_map[op](call->args, vmap);
+    auto tile_op = op_map[op](call->args, call->annotations);
     ICHECK(tile_op.defined());
     return tile_op;
   }
@@ -48,14 +48,13 @@ TileOperator ParseOperator(Call call, BufferMap vmap) {
  * Otherwise returns a default-constructed (empty) TileOperator.
  *
  * @param stmt TIR statement to inspect; expected to be an Evaluate of a Call.
- * @param vmap Mapping of buffer variables used when building the operator.
  * @return TileOperator Parsed operator on success, or a default (empty)
  * TileOperator if `stmt` is not an Evaluate(Call).
  */
-TileOperator ParseOperator(Stmt stmt, BufferMap vmap) {
+TileOperator ParseOperator(Stmt stmt) {
   if (stmt.as<Evaluate>() && stmt.as<EvaluateNode>()->value.as<CallNode>()) {
     auto call = stmt.as<EvaluateNode>()->value.as<CallNode>();
-    return ParseOperator(tvm::ffi::GetRef<Call>(call), vmap);
+    return ParseOperator(tvm::ffi::GetRef<Call>(call));
   }
   return TileOperator();
 }
@@ -74,10 +73,22 @@ TileOperator ParseOperator(Stmt stmt, BufferMap vmap) {
 Var GetVarFromAccessPtr(const PrimExpr &expr) {
   auto call = expr.as<CallNode>();
   ICHECK(call);
-  ICHECK(call->op.same_as(builtin::tvm_access_ptr()));
-  auto var = call->args[1].as<VarNode>();
-  ICHECK(var);
-  return tvm::ffi::GetRef<Var>(var);
+  if (call->op.same_as(builtin::tvm_access_ptr())) {
+    auto var = call->args[1].as<VarNode>();
+    ICHECK(var);
+    return tvm::ffi::GetRef<Var>(var);
+  }
+  if (call->op.same_as(tl::access_ptr())) {
+    ICHECK_EQ(call->args.size(), 3U);
+    auto load = call->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    auto var = load->buffer->data.as<VarNode>();
+    ICHECK(var);
+    return tvm::ffi::GetRef<Var>(var);
+  }
+  LOG(FATAL) << "GetVarFromAccessPtr expects a tvm_access_ptr or tl.access_ptr "
+                "call, but got: "
+             << tvm::ffi::GetRef<Call>(call);
 }
 
 } // namespace tl

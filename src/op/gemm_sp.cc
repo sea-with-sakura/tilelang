@@ -14,19 +14,21 @@
 #include "../target/utils.h"
 #include "builtin.h"
 #include "gemm.h"
+#include "utils.h"
 
 namespace tvm {
 namespace tl {
 
-std::pair<int, int> GemmSPWarpPolicyNode::computeWarpPartition(int M, int N,
-                                                               int block_size,
-                                                               Target target,
-                                                               bool use_wgmma,
-                                                               int bits) const {
+std::pair<int, int>
+GemmSPWarpPolicyNode::computeWarpPartition(int M, int N, int block_size,
+                                           Target target, GemmInst gemm_inst,
+                                           int bits) const {
   int num_warps = block_size / TargetGetWarpSize(target);
 
+  ICHECK(gemm_inst == GemmInst::kMMA || gemm_inst == GemmInst::kWGMMA)
+      << "GemmSP currently only supports MMA and WGMMA";
   auto [m_warp, n_warp] = GemmWarpPolicyNode::computeWarpPartition(
-      M, N, block_size, target, use_wgmma ? GemmInst::kWGMMA : GemmInst::kMMA);
+      M, N, block_size, target, gemm_inst);
 
   // Special handling for gemm_sp when the tiling size is not a multiple
   // This should be consistent with shape check in gemm_sp_sm80.h
@@ -79,16 +81,19 @@ std::pair<int, int> GemmSPWarpPolicyNode::computeWarpPartition(int M, int N,
  * The populated GemmSPNode is stored in the instance's internal data_ pointer.
  *
  * @param args Positional TL call arguments in the above order.
- * @param vmap BufferMap mapping access pointers (from args) to Buffer objects.
  *
  * @note An ICHECK failure is raised if a provided kPack is not 1 or 2.
  */
-GemmSP::GemmSP(Array<PrimExpr> args, BufferMap vmap) {
+GemmSP::GemmSP(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<GemmSPNode> node = tvm::ffi::make_object<GemmSPNode>();
-  node->a_ = vmap[GetVarFromAccessPtr(args[0])];
-  node->e_ = vmap[GetVarFromAccessPtr(args[1])];
-  node->b_ = vmap[GetVarFromAccessPtr(args[2])];
-  node->c_ = vmap[GetVarFromAccessPtr(args[3])];
+  node->aRegion_ = NormalizeToBufferRegion(args[0]);
+  node->eRegion_ = NormalizeToBufferRegion(args[1]);
+  node->bRegion_ = NormalizeToBufferRegion(args[2]);
+  node->cRegion_ = NormalizeToBufferRegion(args[3]);
+  node->a_ = node->aRegion_->buffer;
+  node->e_ = node->eRegion_->buffer;
+  node->b_ = node->bRegion_->buffer;
+  node->c_ = node->cRegion_->buffer;
   node->transA_ = args[4].as<Bool>().value();
   node->transB_ = args[5].as<Bool>().value();
   node->m_ = args[6].as<IntImm>().value()->value;
@@ -146,9 +151,9 @@ Stmt GemmSPNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto block_size = *as_const_int(T.thread_bounds->extent);
   bool maybe_wgmma = TargetIsHopper(T.target) && (this->m_ >= 64) &&
                      (block_size / warp_size % 4 == 0);
-
+  auto gemm_inst = maybe_wgmma ? GemmInst::kWGMMA : GemmInst::kMMA;
   auto [warp_m, warp_n] = policy_->computeWarpPartition(
-      m_, n_, block_size, T.target, maybe_wgmma, a_->dtype.bits());
+      m_, n_, block_size, T.target, gemm_inst, a_->dtype.bits());
 
   std::stringstream ss;
   std::string op_name = "tl::gemm_sp_ss";
@@ -217,7 +222,7 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
   if (completed_)
     return {};
   LayoutMap results;
-  ICHECK(c_.scope() == "local.fragment");
+  ICHECK(IsFragmentBuffer(c_));
   auto thread_range = T.thread_bounds;
   auto block_size = *as_const_int(thread_range->extent);
   if (TargetIsHopper(T.target)) {
@@ -225,8 +230,9 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
     constexpr int wgmma_m = 16 * 4;
     bool maybe_wgmma =
         (this->m_ >= wgmma_m) && (block_size / warp_size % 4 == 0);
+    auto gemm_inst = maybe_wgmma ? GemmInst::kWGMMA : GemmInst::kMMA;
     auto [warp_m, warp_n] = policy_->computeWarpPartition(
-        m_, n_, block_size, T.target, maybe_wgmma, a_->dtype.bits());
+        m_, n_, block_size, T.target, gemm_inst, a_->dtype.bits());
     auto fragment = maybe_wgmma
                         ? makeGemmFragmentCHopper(m_, n_, m_ / warp_m,
                                                   n_ / warp_n, c_->dtype.bits())
@@ -237,9 +243,10 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
       int dim_A = a_->shape.size();
       const int64_t mat_stride = *as_const_int(a_->shape[dim_A - 2]);
       const int64_t mat_continuous = *as_const_int(a_->shape[dim_A - 1]);
-      results.Set(a_, makeGemmABLayoutHopper(mat_stride, mat_continuous,
-                                             mat_continuous, a_->dtype.bits(),
-                                             transA_ ? 1 : 2));
+      auto layout =
+          makeGemmABLayoutHopper(mat_stride, mat_continuous, mat_continuous,
+                                 a_->dtype.bits(), transA_ ? 1 : 2);
+      results.Set(a_, ExpandLayoutToMatchBuffer(layout, a_));
     } else {
       ICHECK(false) << "Not implemented";
     }
@@ -250,15 +257,16 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
       const int64_t mat_continuous = *as_const_int(b_->shape[dim_B - 1]);
       const int64_t continuity =
           transB_ ? mat_continuous : mat_continuous / warp_n;
-      results.Set(b_,
-                  makeGemmABLayoutHopper(mat_stride, mat_continuous, continuity,
-                                         b_->dtype.bits(), transB_ ? 2 : 1));
+      auto layout =
+          makeGemmABLayoutHopper(mat_stride, mat_continuous, continuity,
+                                 b_->dtype.bits(), transB_ ? 2 : 1);
+      results.Set(b_, ExpandLayoutToMatchBuffer(layout, b_));
     } else {
       ICHECK(false) << "WGMMA only support B in shared.";
     }
   } else if (TargetIsAmpere(T.target)) {
     auto [warp_m, warp_n] = policy_->computeWarpPartition(
-        m_, n_, block_size, T.target, false, a_->dtype.bits());
+        m_, n_, block_size, T.target, GemmInst::kMMA, a_->dtype.bits());
     auto fragment = makeGemmSparseFragmentC(m_, n_, m_ / warp_m, n_ / warp_n,
                                             c_->dtype.bits());
     results.Set(c_, fragment->BindThreadRange(thread_range));
@@ -267,9 +275,10 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
       int dim_A = a_->shape.size();
       const int64_t mat_stride = *as_const_int(a_->shape[dim_A - 2]);
       const int64_t mat_continuous = *as_const_int(a_->shape[dim_A - 1]);
-      results.Set(a_, makeGemmSparseAmpereABLayout(mat_stride, mat_continuous,
-                                                   a_->dtype.bits()));
-    } else if (a_.scope() == "local.fragment") {
+      auto layout = makeGemmSparseAmpereABLayout(mat_stride, mat_continuous,
+                                                 a_->dtype.bits());
+      results.Set(a_, ExpandLayoutToMatchBuffer(layout, a_));
+    } else if (IsFragmentBuffer(a_)) {
       // auto fragment = makeGemmFragmentA(M, N, K, M / warp_m, N / warp_n,
       //                                   A->dtype.bits(), trans_A);
       // results.Set(A, fragment->BindThreadRange(thread_range));
@@ -281,9 +290,10 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
       int dim_B = b_->shape.size();
       const int64_t mat_stride = *as_const_int(b_->shape[dim_B - 2]);
       const int64_t mat_continuous = *as_const_int(b_->shape[dim_B - 1]);
-      results.Set(b_, makeGemmSparseAmpereABLayout(mat_stride, mat_continuous,
-                                                   b_->dtype.bits()));
-    } else if (b_.scope() == "local.fragment") {
+      auto layout = makeGemmSparseAmpereABLayout(mat_stride, mat_continuous,
+                                                 b_->dtype.bits());
+      results.Set(b_, ExpandLayoutToMatchBuffer(layout, b_));
+    } else if (IsFragmentBuffer(b_)) {
       // auto fragment =
       //     makeGemmFragmentB(M, N, K, M / warp_m, N / warp_n, trans_B);
       // results.Set(B, fragment->BindThreadRange(thread_range));
@@ -298,12 +308,25 @@ LayoutMap GemmSPNode::InferLayout(const LayoutInferArgs &T,
   return results;
 }
 
-TIR_REGISTER_TL_OP(GemmSP, gemm_sp)
+TIR_REGISTER_TL_TILE_OP(GemmSP, gemm_sp)
     .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TVM_FFI_STATIC_INIT_BLOCK() { GemmSPNode::RegisterReflection(); }
+TVM_REGISTER_OP("tl.GemmSPWarpPolicy")
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "GemmSPWarpPolicy");
 
+TVM_FFI_STATIC_INIT_BLOCK() {
+  GemmSPNode::RegisterReflection();
+  GemmSPWarpPolicyNode::RegisterReflection();
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def(
+      "tl.GemmSPWarpPolicyComputeWarpPartition",
+      [](GemmSPWarpPolicy policy, int M, int N, int block_size, Target target,
+         GemmInst gemm_inst, int bits) {
+        policy->computeWarpPartition(M, N, block_size, target, gemm_inst, bits);
+        return;
+      });
+}
 } // namespace tl
 } // namespace tvm

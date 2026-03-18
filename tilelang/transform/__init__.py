@@ -7,6 +7,8 @@ from .pass_config import PassConfigKey  # noqa: F401
 from tilelang import tvm as tvm  # noqa: F401
 from tvm.ir.transform import PassContext  # noqa: F401
 from .add_bufstore_wrapper import AddWrapperForSingleBufStore  # noqa: F401
+from .hoist_broadcast_values import HoistBroadcastValues  # noqa: F401
+from .decouple_type_cast import DecoupleTypeCast  # noqa: F401
 
 
 def get_pass_context():
@@ -69,6 +71,17 @@ def InjectSoftwarePipeline():
     return _ffi_api.InjectSoftwarePipeline()  # type: ignore
 
 
+def OptimizeCPAsyncSync():
+    """Optimize explicit cp.async commit/wait synchronization intrinsics.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.OptimizeCPAsyncSync()  # type: ignore
+
+
 def FrontendLegalize():
     """FrontendLegalize
 
@@ -92,7 +105,8 @@ def LegalizeNegativeIndex():
 
 
 def InjectAssumes():
-    """Inject Assumes
+    """Inject Assumes for natural shape boundary conditions. And convert Assumes in Evaluate(Call(...)) form
+    (tvm builtin assume call) to AttrNode form.
 
     Returns:
     -------
@@ -100,6 +114,17 @@ def InjectAssumes():
         The result pass
     """
     return _ffi_api.InjectAssumes()
+
+
+def VerifyParallelLoop():
+    """VerifyParallelLoop
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.VerifyParallelLoop()  # type: ignore
 
 
 def LowerHopperIntrin():
@@ -110,8 +135,7 @@ def LowerHopperIntrin():
     fpass : tvm.transform.Pass
         The result pass
     """
-    return (_ffi_api.LowerHopperIntrin() if hasattr(_ffi_api, "LowerHopperIntrin") else lambda f: f
-           )  # type: ignore
+    return _ffi_api.LowerHopperIntrin() if hasattr(_ffi_api, "LowerHopperIntrin") else lambda f: f  # type: ignore
 
 
 def WarpSpecializedPipeline():
@@ -188,6 +212,17 @@ def MergeIfStmt():
         The result pass
     """
     return _ffi_api.MergeIfStmt()  # type: ignore
+
+
+def LoopUnswitching():
+    """LoopUnswitching: Hoist loop-invariant if statements out of loops.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LoopUnswitching()  # type: ignore
 
 
 def MultiVersionBuffer():
@@ -271,6 +306,17 @@ def LegalizeSafeMemoryAccess():
     return _ffi_api.LegalizeSafeMemoryAccess()  # type: ignore
 
 
+def LowerAccessPtr():
+    """Lower TileLang frontend `tl.access_ptr` to `tir.builtin.tvm_access_ptr`.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerAccessPtr()  # type: ignore
+
+
 def MakePackedAPI():
     """MakePackedAPI
 
@@ -304,6 +350,21 @@ def SplitHostDevice():
     return _ffi_api.SplitHostDevice()  # type: ignore
 
 
+def AnnotateReadOnlyParams():
+    """Annotate read-only handle parameters for PrimFuncs.
+
+    Adds attribute `tl.readonly_param_indices` listing param indices that are
+    never written, enabling CUDA codegen to emit `const` qualifiers to unlock
+    read-only cache loads.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AnnotateReadOnlyParams()  # type: ignore
+
+
 def VectorizeLoop(enable_vectorize: bool = True):
     """VectorizeLoop
 
@@ -315,15 +376,28 @@ def VectorizeLoop(enable_vectorize: bool = True):
     return _ffi_api.VectorizeLoop(enable_vectorize)  # type: ignore
 
 
-def InjectPTXAsyncCopy():
-    """Rewrite global to shared memory copy on CUDA with asynchronous copy.
+def LowerPTXAsyncCopy():
+    """Lower eligible global->shared copies into PTX `cp.async` on CUDA.
+
+    When enabled (pass config `tl.enable_async_copy`, default True), this pass
+    may rewrite plain user-written global->shared `BufferStore` patterns (e.g.
+    SIMT copies in `T.Parallel`) into `tir.ptx_cp_async`, and insert
+    `tir.ptx_commit_group` + `tir.ptx_wait_group(0)` to preserve synchronous
+    semantics for normal stores. If explicit commit/wait intrinsics already
+    exist, the pass avoids duplicating them (and may insert a missing commit
+    immediately before an existing wait to cover injected `cp.async`).
 
     Returns
     -------
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.InjectPTXAsyncCopy()  # type: ignore
+    return _ffi_api.LowerPTXAsyncCopy()  # type: ignore
+
+
+def InjectPTXAsyncCopy():
+    """Deprecated alias of `LowerPTXAsyncCopy`."""
+    return LowerPTXAsyncCopy()
 
 
 def LowerDeviceStorageAccessInfo():
@@ -365,8 +439,7 @@ def FlattenBuffer():
 
 
 def EliminateStorageSyncForMBarrier():
-    """EliminateStorageSyncForMBarrier
-    """
+    """EliminateStorageSyncForMBarrier"""
     return _ffi_api.EliminateStorageSyncForMBarrier()  # type: ignore
 
 
@@ -378,19 +451,21 @@ def MergeSharedMemoryAllocations(enable_aggressive_merge: bool = False, align_by
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.MergeSharedMemoryAllocations(enable_aggressive_merge,
-                                                 align_bytes)  # type: ignore
+    return _ffi_api.MergeSharedMemoryAllocations(enable_aggressive_merge, align_bytes)  # type: ignore
 
 
 def LowerL2Persistent():
-    """LowerL2Persistent
-    """
+    """LowerL2Persistent"""
     return _ffi_api.LowerL2Persistent()  # type: ignore
 
 
+def MarkCudaSyncCalls(have_pdl: bool = False):
+    """MarkCudaSyncCalls"""
+    return _ffi_api.MarkCudaSyncCalls(have_pdl)  # type: ignore
+
+
 def PersistThreadblock():
-    """PersistThreadblock
-    """
+    """PersistThreadblock"""
     return _ffi_api.PersistThreadblock()  # type: ignore
 
 
@@ -409,9 +484,23 @@ def AlignDynamicSharedMemoryAllocations(align_bytes: int = 16):
 
 
 def LowerSharedBarrier():
-    """LowerSharedBarrier
-    """
+    """LowerSharedBarrier"""
     return _ffi_api.LowerSharedBarrier()  # type: ignore
+
+
+def PlanAndUpdateBufferAllocationLocation():
+    """Plan and update buffer allocation locations within PrimFuncs.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.PlanAndUpdateBufferAllocationLocation()  # type: ignore
+
+
+def HoistNonRestrictParams():
+    return _ffi_api.HoistNonRestrictParams()  # type: ignore
 
 
 def StorageRewrite():
@@ -426,20 +515,17 @@ def StorageRewrite():
 
 
 def LowerOpaqueBlock():
-    """LowerOpaqueBlock
-    """
+    """LowerOpaqueBlock"""
     return _ffi_api.LowerOpaqueBlock()  # type: ignore
 
 
 def LowerThreadAllreduce():
-    """LowerThreadAllreduce
-    """
+    """LowerThreadAllreduce"""
     return _ffi_api.LowerThreadAllreduce()  # type: ignore
 
 
 def LowerIntrin():
-    """LowerIntrin
-    """
+    """LowerIntrin"""
     return _ffi_api.LowerIntrin()  # type: ignore
 
 
@@ -457,8 +543,7 @@ def LowerDeviceKernelLaunch():
 
 
 def LowerSharedTmem():
-    """LowerSharedTmem
-    """
+    """LowerSharedTmem"""
     return _ffi_api.LowerSharedTmem()  # type: ignore
 
 
@@ -472,3 +557,43 @@ def LayoutReducer():
         The transform pass object produced by the FFI backend.
     """
     return _ffi_api.LayoutReducer()  # type: ignore
+
+
+def UnrollLoop():
+    """Unroll loops as in Halide pipeline.
+
+    This pass unrolls loops based on configuration options including:
+    - auto_max_step: Threshold of number of steps to be automatically unrolled
+    - auto_max_depth: Maximum nested level of loops that can be automatically unrolled
+    - auto_max_extent: Maximum extent of loop that will be unrolled
+    - explicit_unroll: Whether to explicitly unroll instead of setting a pragma
+    - unroll_local_access: Whether to always unroll local access
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.UnrollLoop()  # type: ignore
+
+
+def LowerLDGSTG():
+    """Lower Ramp-based global memory load/store to ldg/stg intrinsics.
+
+    This pass transforms vectorized global memory loads and stores (using Ramp indices)
+    into explicit ldg32/64/128/256 and stg32/64/128/256 intrinsics for better codegen.
+
+    Key behaviors:
+    - Converts Ramp-based global BufferLoad to ldg intrinsics
+    - Converts Ramp-based global BufferStore to stg intrinsics
+    - Supports predicated loads (if_then_else with else=0)
+    - Supports predicated stores (if in then case)
+    - Skips loads in async scope (will be lowered to cp.async)
+    - Only enabled for CUDA targets
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerLDGSTG()  # type: ignore

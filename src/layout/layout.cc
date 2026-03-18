@@ -4,6 +4,7 @@
  */
 
 #include "layout.h"
+#include <tvm/ffi/error.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 
@@ -12,6 +13,8 @@
 #include <tvm/tir/stmt_functor.h>
 
 #include "arith/pattern_match.h"
+#include "tvm/node/functor.h"
+#include "tvm/node/repr_printer.h"
 #include "utils.h"
 
 namespace tvm {
@@ -78,7 +81,8 @@ void LayoutNode::RegisterReflection() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<LayoutNode>()
       .def_ro("input_size", &LayoutNode::input_size_)
-      .def_ro("forward_index", &LayoutNode::forward_index_);
+      .def_ro("forward_index", &LayoutNode::forward_index_)
+      .def("_DebugOutput", &LayoutNode::DebugOutput);
 }
 
 void LayoutNode::UpdateAnalyzer(arith::Analyzer *analyzer) const {
@@ -154,6 +158,88 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
   }
 
   return result;
+}
+
+Layout LayoutNode::Repeat(int dim, int factor) const {
+  if (factor < 1) {
+    TVM_FFI_THROW(ValueError) << "factor must be >= 1, got " << factor;
+  }
+  if (factor == 1) {
+    return ffi::GetRef<Layout>(this);
+  }
+
+  const int ndim = static_cast<int>(InputDim());
+  if (ndim <= 0) {
+    TVM_FFI_THROW(ValueError) << "Cannot repeat a 0-dim layout";
+  }
+  int normalized_dim = dim;
+  if (normalized_dim < 0) {
+    normalized_dim += ndim;
+  }
+  if (normalized_dim < 0 || normalized_dim >= ndim) {
+    TVM_FFI_THROW(ValueError)
+        << "dim out of range: dim=" << dim << ", ndim=" << ndim;
+  }
+
+  Array<PrimExpr> new_input_size = input_size_;
+  PrimExpr extent_dim = input_size_[normalized_dim];
+  new_input_size.Set(normalized_dim, extent_dim * Integer(factor));
+
+  Map<Var, PrimExpr> vmap;
+  vmap.Set(InputPlaceholder(normalized_dim),
+           FloorMod(InputPlaceholder(normalized_dim), extent_dim));
+
+  Array<PrimExpr> new_forward_index;
+  new_forward_index.reserve(OutputDim() + 1);
+  new_forward_index.push_back(
+      FloorDiv(InputPlaceholder(normalized_dim), extent_dim));
+  for (const auto &e : forward_index_) {
+    new_forward_index.push_back(Substitute(e, vmap));
+  }
+
+  return Layout(new_input_size, new_forward_index);
+}
+
+Layout LayoutNode::Expand(const Array<PrimExpr> &leading_shape) const {
+  if (leading_shape.empty()) {
+    return ffi::GetRef<Layout>(this);
+  }
+
+  for (size_t i = 0; i < leading_shape.size(); ++i) {
+    if (auto imm = leading_shape[i].as<IntImm>()) {
+      if ((*imm)->value <= 0) {
+        TVM_FFI_THROW(ValueError)
+            << "leading_shape[" << i << "] must be > 0, got " << (*imm)->value;
+      }
+    }
+  }
+
+  const size_t offset = leading_shape.size();
+
+  Array<PrimExpr> new_input_size;
+  new_input_size.reserve(offset + InputDim());
+  for (const auto &s : leading_shape) {
+    new_input_size.push_back(s);
+  }
+  for (const auto &s : input_size_) {
+    new_input_size.push_back(s);
+  }
+
+  Map<Var, PrimExpr> vmap;
+  for (size_t i = 0; i < InputDim(); ++i) {
+    vmap.Set(InputPlaceholder(i), InputPlaceholder(i + offset));
+  }
+
+  Array<PrimExpr> new_forward_index;
+  new_forward_index.reserve(offset + OutputDim());
+  for (size_t i = 0; i < offset; ++i) {
+    new_forward_index.push_back(InputPlaceholder(i));
+  }
+  for (const auto &e : forward_index_) {
+    new_forward_index.push_back(Substitute(e, vmap));
+  }
+
+  return Layout(new_input_size, new_forward_index);
 }
 
 Fragment FragmentNode::Repeat(const Array<PrimExpr> &repeats,
@@ -233,7 +319,8 @@ Fragment FragmentNode::DeReplicate() const {
   PrimExpr new_forward_thread = Substitute(forward_thread_, vmap);
   Array<PrimExpr> new_forward_index = {FloorDiv(forward_index_[0], factor)};
   return Fragment(input_size_, new_forward_index, new_forward_thread,
-                  int(*rep_size) / factor, std::nullopt);
+                  int(*rep_size) / factor, std::nullopt)
+      ->BindThreadRange(Range(0, ThreadExtent()));
 }
 
 Fragment FragmentNode::BindThreadRange(Range thread_range) const {
@@ -297,13 +384,17 @@ std::pair<Layout, arith::IterMapLevel> LayoutNode::InverseWithLevel() const {
 }
 
 Layout LayoutNode::Reshape(const Array<PrimExpr> &shape,
-                           arith::Analyzer *analyzer) const {
+                           arith::Analyzer *analyzer,
+                           const PrimExpr rescale_num,
+                           const PrimExpr rescale_den) const {
+
   // Fast path: if shape is the same, return the original layout
   if (StructuralEqual()(InputShape(), shape)) {
     return ffi::GetRef<Layout>(this);
   }
 
-  // Step 1. Prove the product of InputShape is equal to the product of shape
+  // Step 1. Prove the product relation holds under rescale:
+  //   prod(InputShape) * rescale_num == prod(shape) * rescale_den
   PrimExpr input_shape_product = Integer(1);
   for (const auto &dim : InputShape()) {
     input_shape_product *= dim;
@@ -317,8 +408,10 @@ Layout LayoutNode::Reshape(const Array<PrimExpr> &shape,
   // potential null dereference paths flagged by static analysis.
   arith::Analyzer fallback_analyzer;
   arith::Analyzer *az = analyzer ? analyzer : &fallback_analyzer;
-  ICHECK(az->CanProveEqual(input_shape_product, shape_product))
-      << "InputShape() = " << InputShape() << " shape = " << shape;
+  ICHECK(az->CanProveEqual(input_shape_product * rescale_num,
+                           shape_product * rescale_den))
+      << "InputShape() = " << InputShape() << " shape = " << shape
+      << ", rescale_num = " << rescale_num << ", rescale_den = " << rescale_den;
 
   // Step 2. Create new forward indices by reshaping
   // For each dimension in the new shape, we create a placeholder variable
@@ -339,13 +432,17 @@ Layout LayoutNode::Reshape(const Array<PrimExpr> &shape,
     }
     flat_index = flat_index + new_vars[i] * stride;
   }
+  // Convert new flat index (in units of new elements) to the old flat index
+  // (in units of old elements) using the rational rescale factor.
+  // old_flat = floor((flat_index * rescale_den) / rescale_num)
+  PrimExpr old_flat_index = floordiv(flat_index * rescale_den, rescale_num);
   // Step 4. Convert flat index back to original shape indices
   // For original shape [s0, s1, ..., sm]:
   // i0 = flat_index // (s1 * s2 * ... * sm)
   // i1 = (flat_index % (s1 * s2 * ... * sm)) // (s2 * s3 * ... * sm)
   // ...
   Array<PrimExpr> original_indices;
-  PrimExpr remaining = flat_index;
+  PrimExpr remaining = old_flat_index;
   for (size_t i = 0; i < InputShape().size(); ++i) {
     PrimExpr stride = Integer(1);
     for (size_t j = i + 1; j < InputShape().size(); ++j) {
@@ -373,7 +470,10 @@ Layout LayoutNode::Reshape(const Array<PrimExpr> &shape,
 }
 
 Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,
-                             arith::Analyzer *analyzer) const {
+                             arith::Analyzer *analyzer,
+                             const PrimExpr rescale_num,
+                             const PrimExpr rescale_den) const {
+
   // Fast path: identical input shape, return self
   if (StructuralEqual()(InputShape(), shape)) {
     return ffi::GetRef<Fragment>(this);
@@ -390,8 +490,9 @@ Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,
   // Use provided analyzer if present, otherwise a local fallback.
   arith::Analyzer fallback_analyzer;
   arith::Analyzer *az = analyzer ? analyzer : &fallback_analyzer;
-  ICHECK(az->CanProveEqual(input_prod, shape_prod))
+  ICHECK(az->CanProveEqual(input_prod * rescale_num, shape_prod * rescale_den))
       << "InputShape() = " << InputShape() << " shape = " << shape
+      << ", rescale_num = " << rescale_num << ", rescale_den = " << rescale_den
       << " input fragment layout is = " << DebugOutput();
 
   // 2) Build flat index from new-shape indices
@@ -414,9 +515,12 @@ Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,
       stride = stride * shape[j];
     flat = flat + new_vars[i] * stride;
   }
+  // Convert to old flat index units using the rational rescale factor.
+  // old_flat = floor((flat * rescale_den) / rescale_num)
+  PrimExpr old_flat = floordiv(flat * rescale_den, rescale_num);
   // 3) Recover original indices from flat index
   Array<PrimExpr> orig_indices;
-  PrimExpr remain = flat;
+  PrimExpr remain = old_flat;
   for (size_t i = 0; i < InputShape().size(); ++i) {
     PrimExpr stride = Integer(1);
     for (size_t j = i + 1; j < InputShape().size(); ++j)
@@ -463,18 +567,20 @@ Layout LayoutNode::Inverse() const {
 PrimExpr infer_fragment_index(const Map<Var, Range> &input_iters,
                               const PrimExpr &forward_thread,
                               arith::Analyzer *analyzer) {
-  Array<arith::IterSplitExpr> splits = DivideUnusedIterators(
-      {forward_thread}, ToIterVars(input_iters), analyzer);
-
-  Array<arith::IterSplitExpr> split_without_rep;
-  for (const auto &split : splits) {
-    CHECK(split->source->source.as<Var>());
-    if (split->source->source.as<Var>().value().same_as(
-            ReplicationPlaceholder()))
-      continue;
-    split_without_rep.push_back(split);
+  // we build iter_vars from input_iters, but set _rep to range [0, 1)
+  // to make it not contribute to the index of the forward_idx
+  Array<IterVar> iter_vars;
+  for (const auto &[var, range_] : input_iters) {
+    Range range = range_;
+    if (var.same_as(ReplicationPlaceholder())) {
+      range = Range(0, 1);
+    }
+    iter_vars.push_back(IterVar(range, var, IterVarType::kDataPar));
   }
-  return MakeFlattenedExpression(split_without_rep);
+
+  Array<arith::IterSplitExpr> splits =
+      DivideUnusedIterators({forward_thread}, iter_vars, analyzer);
+  return MakeFlattenedExpression(splits);
 }
 
 FragmentNode::FragmentNode(Array<PrimExpr> input_size,
@@ -529,11 +635,64 @@ Fragment::Fragment(Array<PrimExpr> input_size, Array<PrimExpr> forward_index,
   data_ = std::move(n);
 }
 
+Fragment Fragment::FullyReplicated(Array<PrimExpr> shape,
+                                   PrimExpr thread_extent) {
+  return Fragment(shape, {}, ReplicationPlaceholder(), thread_extent,
+                  std::nullopt)
+      ->BindThreadRange(Range(0, thread_extent));
+}
+
 // which means the forward_thread is rep_var -> lambda i, rep: rep
 bool FragmentNode::IsCompletedReplicated() const {
   arith::Analyzer analyzer;
   return ExprDeepEqual()(analyzer.Simplify(forward_thread_),
                          ReplicationPlaceholder());
+}
+
+arith::IterMapResult FragmentNode::DetectInjective() const {
+  // lei:To perform injective check, we need to reverse the layout
+  // and use surjective check, now we use bijective check for convenience
+  // can be relaxed in future
+  arith::Analyzer analyzer;
+  // Build a flat indices array: [forward_thread_, forward_index_[...]]
+  Array<PrimExpr> indices;
+  indices.push_back(forward_thread_);
+  for (const auto &e : forward_index_) {
+    indices.push_back(e);
+  }
+
+  // Mirror Layout::InverseWithLevel(): if any participating shape is
+  // symbolic, relax to NoCheck and rely on runtime guards elsewhere.
+  auto collect_symbolic = [&](const Array<PrimExpr> &shape) {
+    Array<PrimExpr> symbolic_dims;
+    for (const auto &dim : shape) {
+      if (!as_const_int(dim)) {
+        symbolic_dims.push_back(dim);
+      }
+    }
+    return symbolic_dims;
+  };
+
+  Array<PrimExpr> symbolic_dims = collect_symbolic(InputShape());
+  Array<PrimExpr> output_shape = OutputShape();
+  symbolic_dims.insert(symbolic_dims.end(), output_shape.begin(),
+                       output_shape.end());
+  // Also consider replicate size for fragments
+  if (!as_const_int(ReplicateExtent())) {
+    symbolic_dims.push_back(ReplicateExtent());
+  }
+  symbolic_dims = collect_symbolic(symbolic_dims);
+
+  bool is_static_shape = symbolic_dims.empty();
+  auto level = is_static_shape ? arith::IterMapLevel::Bijective
+                               : arith::IterMapLevel::NoCheck;
+  if (!is_static_shape) {
+    DLOG(WARNING)
+        << "Fragment::DetectInjective on symbolic layout, falling back to "
+        << "NoCheck; symbolic dims: " << symbolic_dims;
+  }
+
+  return arith::DetectIterMap(indices, getVarMap(), 1, level, &analyzer);
 }
 
 PrimExpr FragmentNode::ThreadExtent() const {
@@ -621,8 +780,24 @@ std::string FragmentNode::DebugOutput() const {
 bool LayoutNode::IsEqual(const LayoutNode *other, bool skip_index) const {
   bool ret = StructuralEqual()(this->InputShape(), other->InputShape());
   ret &= StructuralEqual()(this->OutputShape(), other->OutputShape());
+  if (!ret) {
+    return false;
+  }
   if (!skip_index) {
-    ret &= StructuralEqual()(this->forward_index_, other->forward_index_);
+    // Create common variables for comparison. Using Forward with common
+    // variables ensures we compare the actual mapping rather than AST
+    // structure, since InputPlaceholder may compare equal in StructuralEqual.
+    Array<PrimExpr> common_vars;
+    for (size_t i = 0; i < this->InputDim(); i++) {
+      common_vars.push_back(Var("_cmp_v" + std::to_string(i)));
+    }
+
+    auto this_forward = this->Forward(common_vars);
+    auto other_forward = other->Forward(common_vars);
+
+    if (!StructuralEqual()(this_forward, other_forward)) {
+      return false;
+    }
   }
   return ret;
 }
@@ -643,8 +818,32 @@ bool FragmentNode::IsEqual(const FragmentNode *other, bool skip_index) const {
   ret &= StructuralEqual()(this->OutputShape(), other->OutputShape());
   ret &= StructuralEqual()(this->ReplicateExtent(), other->ReplicateExtent());
   ret &= StructuralEqual()(this->ThreadExtent(), other->ThreadExtent());
+  if (!ret) {
+    return false;
+  }
   if (!skip_index) {
-    ret &= StructuralEqual()(this->forward_index_, other->forward_index_);
+    // Create common variables for comparison. Using Forward/ForwardThread with
+    // common variables ensures we compare the actual mapping rather than AST
+    // structure, since InputPlaceholder may compare equal in StructuralEqual.
+    Array<PrimExpr> common_vars;
+    for (size_t i = 0; i < this->InputDim(); i++) {
+      common_vars.push_back(Var("_cmp_v" + std::to_string(i)));
+    }
+    Var common_rep("_cmp_rep");
+
+    auto this_forward = this->Forward(common_vars);
+    auto other_forward = other->Forward(common_vars);
+
+    if (!StructuralEqual()(this_forward, other_forward)) {
+      return false;
+    }
+
+    // Also compare forward_thread mapping.
+    auto this_thread = this->ForwardThread(common_vars, common_rep);
+    auto other_thread = other->ForwardThread(common_vars, common_rep);
+    if (!StructuralEqual()(this_thread, other_thread)) {
+      return false;
+    }
   }
   return ret;
 }
@@ -653,8 +852,19 @@ void FragmentNode::RegisterReflection() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<FragmentNode>()
       .def_ro("forward_thread", &FragmentNode::forward_thread_)
-      .def_ro("replicate_size", &FragmentNode::replicate_size_);
+      .def_ro("replicate_size", &FragmentNode::replicate_size_)
+      .def("_DebugOutput", &FragmentNode::DebugOutput);
 }
+
+TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
+    .set_dispatch<FragmentNode>([](const ObjectRef &obj, ReprPrinter *p) {
+      auto *node = static_cast<const FragmentNode *>(obj.get());
+      p->stream << node->DebugOutput();
+    })
+    .set_dispatch<LayoutNode>([](const ObjectRef &obj, ReprPrinter *p) {
+      auto *node = static_cast<const LayoutNode *>(obj.get());
+      p->stream << node->DebugOutput();
+    });
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
@@ -669,10 +879,23 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.Layout_output_shape",
            [](Layout layout) { return layout->OutputShape(); })
       .def("tl.Layout_inverse", [](Layout layout) { return layout->Inverse(); })
+      .def("tl.Layout_reshape",
+           [](Layout layout, Array<PrimExpr> shape, PrimExpr rescale_num,
+              PrimExpr rescale_den) {
+             return layout->Reshape(shape, nullptr, rescale_num, rescale_den);
+           })
       .def("tl.Layout_index",
            [](Layout layout) { return layout->GetForwardIndex(); })
       .def("tl.Layout_forward_vars",
            [](Layout layout) { return layout->GetForwardVars(); })
+      .def("tl.Layout_repeat",
+           [](Layout layout, int dim, int factor) {
+             return layout->Repeat(dim, factor);
+           })
+      .def("tl.Layout_expand",
+           [](Layout layout, Array<PrimExpr> leading_shape) {
+             return layout->Expand(leading_shape);
+           })
       .def("tl.Layout_is_equal",
            [](Layout layout, Layout other) {
              const LayoutNode *other_node = other.as<LayoutNode>();
@@ -736,21 +959,26 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                                           element_size, k_inner);
            })
       .def("tl.make_full_bank_swizzled_layout",
-           [](int stride, int continuous, int element_size) {
-             return makeFullBankSwizzleLayout(stride, continuous, element_size);
+           [](const Buffer &buffer) {
+             return makeFullBankSwizzleLayout(buffer);
            })
       .def("tl.make_half_bank_swizzled_layout",
-           [](int stride, int continuous, int element_size) {
-             return makeHalfBankSwizzleLayout(stride, continuous, element_size);
+           [](const Buffer &buffer) {
+             return makeHalfBankSwizzleLayout(buffer);
            })
       .def("tl.make_quarter_bank_swizzled_layout",
-           [](int stride, int continuous, int element_size) {
-             return makeQuarterBankSwizzleLayout(stride, continuous,
-                                                 element_size);
+           [](const Buffer &buffer) {
+             return makeQuarterBankSwizzleLayout(buffer);
            })
-      .def("tl.make_linear_layout", [](int stride, int continuous) {
-        return makeGemmLayoutLinear(stride, continuous);
-      });
+      .def("tl.make_linear_layout",
+           [](Array<PrimExpr> shape) { return makeLinearLayout(shape); })
+      .def("tl.make_gemm_fragment_8x8", []() { return makeGemmFragment8x8(); })
+      .def("tl.make_gemm_fragment_8x8_transposed",
+           []() { return makeGemmFragment8x8Transposed(); })
+      .def("tl.make_fully_replicated_layout_fragment",
+           [](Array<PrimExpr> shape, PrimExpr thread_extent) {
+             return Fragment::FullyReplicated(shape, thread_extent);
+           });
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
